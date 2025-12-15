@@ -1,10 +1,10 @@
 import 'dart:io';
 import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 import 'package:ultralytics_yolo/widgets/yolo_controller.dart';
-
 
 void main() {
   runApp(const MaterialApp(
@@ -69,6 +69,7 @@ class _ImageDetectionScreenState extends State<ImageDetectionScreen> {
   List<dynamic>? _results;
   YOLO? _yolo;
   bool _isLoading = false;
+  ui.Image? _decodedImage; // Untuk menyimpan info ukuran asli gambar
 
   @override
   void initState() {
@@ -77,10 +78,9 @@ class _ImageDetectionScreenState extends State<ImageDetectionScreen> {
   }
 
   Future<void> _loadModel() async {
-    // Ganti 'yolo11n' dengan nama model Anda (tanpa ekstensi untuk iOS, dengan .tflite untuk Android jika perlu)
     _yolo = YOLO(
-      modelPath: 'best_float32.tflite', 
-      task: YOLOTask.detect, // Pastikan task sesuai (detect, segment, dll)
+      modelPath: 'best_float32.tflite',
+      task: YOLOTask.detect,
     );
     await _yolo!.loadModel();
   }
@@ -88,9 +88,16 @@ class _ImageDetectionScreenState extends State<ImageDetectionScreen> {
   Future<void> _pickImage() async {
     final XFile? photo = await _picker.pickImage(source: ImageSource.gallery);
     if (photo != null) {
+      final file = File(photo.path);
+      // Decode gambar untuk mendapatkan ukuran aslinya (penting untuk scaling kotak)
+      final data = await file.readAsBytes();
+      final decoded = await decodeImageFromList(data);
+
       setState(() {
-        _image = File(photo.path);
+        _image = file;
+        _decodedImage = decoded;
         _isLoading = true;
+        _results = null;
       });
       _predict();
     }
@@ -98,13 +105,12 @@ class _ImageDetectionScreenState extends State<ImageDetectionScreen> {
 
   Future<void> _predict() async {
     if (_image == null || _yolo == null) return;
-    
+
     final Uint8List imageBytes = await _image!.readAsBytes();
-    final result = await _yolo!.predict(imageBytes); //
-    
+    final result = await _yolo!.predict(imageBytes);
+
     setState(() {
-      // Mengambil daftar kotak pembatas (bounding boxes)
-      _results = result['boxes']; 
+      _results = result['boxes'];
       _isLoading = false;
     });
   }
@@ -118,32 +124,42 @@ class _ImageDetectionScreenState extends State<ImageDetectionScreen> {
           Expanded(
             child: _image == null
                 ? const Center(child: Text("Belum ada gambar dipilih"))
-                : Stack(
-                    children: [
-                      Image.file(_image!, fit: BoxFit.contain, width: double.infinity),
-                      // Tampilkan overlay hasil deteksi sederhana
-                      if (_results != null)
-                        ListView.builder(
-                          itemCount: _results!.length,
-                          itemBuilder: (context, index) {
-                            final box = _results![index];
-                            return Container(
-                              margin: const EdgeInsets.all(4),
-                              padding: const EdgeInsets.all(8),
-                              color: Colors.black54,
-                              child: Text(
-                                "${box['class']}: ${(box['confidence'] * 100).toStringAsFixed(1)}%",
-                                style: const TextStyle(color: Colors.white),
+                : LayoutBuilder(
+                    builder: (context, constraints) {
+                      return Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          // Layer 1: Gambar
+                          Image.file(
+                            _image!,
+                            fit: BoxFit.contain,
+                            width: constraints.maxWidth,
+                            height: constraints.maxHeight,
+                          ),
+                          // Layer 2: Bounding Box Overlay
+                          if (_results != null && _decodedImage != null)
+                            CustomPaint(
+                              size: Size(constraints.maxWidth, constraints.maxHeight),
+                              painter: BoundingBoxPainter(
+                                results: _results!,
+                                originalSize: Size(
+                                  _decodedImage!.width.toDouble(),
+                                  _decodedImage!.height.toDouble(),
+                                ),
+                                displaySize: Size(
+                                  constraints.maxWidth,
+                                  constraints.maxHeight,
+                                ),
                               ),
-                            );
-                          },
-                        ),
-                    ],
+                            ),
+                        ],
+                      );
+                    },
                   ),
           ),
           if (_isLoading) const CircularProgressIndicator(),
           Padding(
-            padding: const EdgeInsets.all(100.0),
+            padding: const EdgeInsets.all(20.0),
             child: ElevatedButton(
               onPressed: _pickImage,
               child: const Text("Pilih Gambar"),
@@ -153,6 +169,75 @@ class _ImageDetectionScreenState extends State<ImageDetectionScreen> {
       ),
     );
   }
+}
+
+// Painter untuk menggambar kotak di atas gambar
+class BoundingBoxPainter extends CustomPainter {
+  final List<dynamic> results;
+  final Size originalSize; // Ukuran asli gambar (misal 1920x1080)
+  final Size displaySize;  // Ukuran gambar di layar HP
+
+  BoundingBoxPainter({
+    required this.results,
+    required this.originalSize,
+    required this.displaySize,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.red
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 3.0;
+
+    final textPaint = TextPainter(
+      textDirection: TextDirection.ltr,
+    );
+
+    // Hitung faktor scaling agar sesuai dengan BoxFit.contain
+    final double scaleX = displaySize.width / originalSize.width;
+    final double scaleY = displaySize.height / originalSize.height;
+    final double scale = scaleX < scaleY ? scaleX : scaleY;
+
+    // Hitung offset (jarak kosong di kiri/atas karena gambar di-center)
+    final double offsetX = (displaySize.width - (originalSize.width * scale)) / 2;
+    final double offsetY = (displaySize.height - (originalSize.height * scale)) / 2;
+
+    for (var box in results) {
+      // Ambil data dari hasil deteksi
+      // Asumsi format box dari plugin: {'x': ..., 'y': ..., 'width': ..., 'height': ...}
+      // Koordinat ini biasanya relatif terhadap ukuran asli gambar
+      final double x = (box['x'] ?? 0).toDouble();
+      final double y = (box['y'] ?? 0).toDouble();
+      final double w = (box['width'] ?? 0).toDouble();
+      final double h = (box['height'] ?? 0).toDouble();
+      final String label = "${box['class']} ${(box['confidence'] * 100).toStringAsFixed(0)}%";
+
+      // Transformasi koordinat ke ukuran layar
+      final double left = (x * scale) + offsetX;
+      final double top = (y * scale) + offsetY;
+      final double width = w * scale;
+      final double height = h * scale;
+
+      final rect = Rect.fromLTWH(left, top, width, height);
+      canvas.drawRect(rect, paint);
+
+      // Gambar Label Teks
+      textPaint.text = TextSpan(
+        text: label,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 14,
+          backgroundColor: Colors.red,
+        ),
+      );
+      textPaint.layout();
+      textPaint.paint(canvas, Offset(left, top - 20)); // Gambar teks sedikit di atas kotak
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
 
 // --- 3. LAYAR DETEKSI KAMERA (REAL-TIME) ---
@@ -166,11 +251,20 @@ class CameraDetectionScreen extends StatefulWidget {
 class _CameraDetectionScreenState extends State<CameraDetectionScreen> {
   late YOLOViewController _controller;
   List<dynamic> _currentDetections = [];
+  bool _isControllerReady = false;
 
   @override
   void initState() {
     super.initState();
     _controller = YOLOViewController();
+    
+    // PERBAIKAN: Set threshold langsung di sini sebelum View dibuat.
+    // Fungsi ini akan menyimpan nilai setting dan menerapkannya otomatis 
+    // begitu kamera/model siap (init).
+    _controller.setThresholds(
+      confidenceThreshold: 0.2, // 20% (Lebih sensitif)
+      iouThreshold: 0.4,
+    );
   }
 
   @override
@@ -179,24 +273,23 @@ class _CameraDetectionScreenState extends State<CameraDetectionScreen> {
       appBar: AppBar(title: const Text("Kamera Real-time")),
       body: Stack(
         children: [
-          // Widget Kamera Bawaan Plugin
           YOLOView(
-            modelPath: 'best_float32.tflite', // Ganti dengan nama model Anda
+            modelPath: 'best_float32.tflite',
             task: YOLOTask.detect,
             controller: _controller,
+            // PERBAIKAN: Tambahkan parameter threshold di sini juga agar sinkron saat start
+            confidenceThreshold: 0.2, 
+            iouThreshold: 0.4,
             onResult: (results) {
-              // Callback ini memberikan hasil deteksi setiap frame
-              // Perhatikan: format 'results' di onResult YOLOView mungkin berupa List<YOLOResult> 
-              // atau Map tergantung versi. Di versi terbaru, ini seringkali list object.
               setState(() {
-                 // Kita simpan untuk menampilkan jumlah objek terdeteksi
-                 // Anda bisa print(results) untuk melihat struktur datanya
-                 _currentDetections = results;
+                _currentDetections = results;
+                // Jika sudah ada hasil, berarti controller sudah aktif
+                if (!_isControllerReady) _isControllerReady = true;
               });
             },
           ),
           
-          // Overlay Informasi Sederhana
+          // Overlay Informasi
           Positioned(
             bottom: 30,
             left: 20,
@@ -207,10 +300,23 @@ class _CameraDetectionScreenState extends State<CameraDetectionScreen> {
                 color: Colors.black.withOpacity(0.6),
                 borderRadius: BorderRadius.circular(10),
               ),
-              child: Text(
-                "Objek Terdeteksi: ${_currentDetections.length}",
-                style: const TextStyle(color: Colors.white, fontSize: 18),
-                textAlign: TextAlign.center,
+              child: Column(
+                children: [
+                  Text(
+                    "Objek Terdeteksi: ${_currentDetections.length}",
+                    style: const TextStyle(color: Colors.white, fontSize: 18),
+                    textAlign: TextAlign.center, 
+                  ),
+                  // Indikator sederhana
+                  if (_currentDetections.isEmpty)
+                     const Padding(
+                       padding: EdgeInsets.only(top: 8.0),
+                       child: Text(
+                         "Mencari objek...",
+                         style: TextStyle(color: Colors.grey, fontSize: 12),
+                       ),
+                     )
+                ],
               ),
             ),
           ),
